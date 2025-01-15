@@ -6,8 +6,11 @@ use std::thread;
 use std::{
     ffi::OsStr,
     fs,
-    io::{self, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    io::Write,
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        process::CommandExt,
+    },
     process::Command,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
@@ -64,10 +67,10 @@ struct MirageFS {
 }
 
 impl MirageFS {
-    fn get_content(&self) -> String {
+    fn get_content(&self, req: &Request) -> String {
         match &self.mode {
             ContentMode::Static(data) => data.clone(),
-            ContentMode::Exec(command) => self.run_command(command),
+            ContentMode::Exec(command) => self.run_command(command, req),
             ContentMode::ReplaceRegex(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, replacement) in pairs {
@@ -78,7 +81,7 @@ impl MirageFS {
             ContentMode::ReplaceExec(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, command) in pairs {
-                    content = content.replace(target, &self.run_command(command));
+                    content = content.replace(target, &self.run_command(command, req));
                 }
                 content
             }
@@ -86,12 +89,14 @@ impl MirageFS {
         }
     }
 
-    fn run_command(&self, command: &str) -> String {
+    fn run_command(&self, command: &str, req: &Request) -> String {
         match Command::new(&self.shell)
             .arg("-c")
             .arg(command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .uid(req.uid())
+            .gid(req.gid())
             .spawn()
         {
             Ok(mut child) => {
@@ -116,8 +121,8 @@ impl MirageFS {
         }
     }
 
-    fn get_attr(&self) -> FileAttr {
-        let dynamic_size = self.get_content().len() as u64;
+    fn get_attr(&self, req: &Request) -> FileAttr {
+        let dynamic_size = self.get_content(req).len() as u64;
         let mut updated_attr = self.original_attr;
         updated_attr.size = dynamic_size;
         updated_attr
@@ -125,17 +130,17 @@ impl MirageFS {
 }
 
 impl Filesystem for MirageFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, _name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request, parent: u64, _name: &OsStr, reply: ReplyEntry) {
         if parent == 1 {
-            reply.entry(&TTL, &self.get_attr(), 0);
+            reply.entry(&TTL, &self.get_attr(req), 0);
         } else {
             reply.error(ENOENT);
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == 1 {
-            reply.attr(&TTL, &self.get_attr());
+            reply.attr(&TTL, &self.get_attr(req));
         } else {
             reply.error(ENOENT);
         }
@@ -143,7 +148,7 @@ impl Filesystem for MirageFS {
 
     fn read(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -153,7 +158,7 @@ impl Filesystem for MirageFS {
         reply: ReplyData,
     ) {
         if ino == 1 {
-            let content = self.get_content();
+            let content = self.get_content(req);
             let data = &content.as_bytes()
                 [offset as usize..(offset as usize + size as usize).min(content.len())];
             reply.data(data);
