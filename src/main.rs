@@ -2,6 +2,7 @@ use clap::Parser;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyEntry, Request,
 };
+use std::thread;
 use std::{
     ffi::OsStr,
     fs,
@@ -15,14 +16,14 @@ use std::{
 const ENOENT: i32 = 2;
 const TTL: Duration = Duration::from_secs(1);
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     author = "FlorianNAdam",
     about = "Ephemerally overlay file contents at runtime using FUSE"
 )]
 struct Args {
     #[arg(help = "Path to the file to overlay")]
-    file_path: String,
+    file_paths: Vec<String>,
 
     #[arg(long, conflicts_with_all = &["exec", "replace_regex", "replace_exec"], help = "Use the specified string as the file content.")]
     content: Option<String>,
@@ -178,71 +179,84 @@ fn parse_pairs(pairs: Vec<String>) -> Vec<(String, String)> {
 fn main() {
     let args = Args::parse();
 
-    let original_content = match fs::read_to_string(&args.file_path) {
-        Ok(content) => Arc::new(content),
-        Err(e) => {
-            eprintln!("Failed to read file '{}': {}", args.file_path, e);
-            return;
+    let paths = args.clone().file_paths.into_iter().map(|s| s.to_string());
+
+    let mut handles = vec![];
+    for file_path in paths {
+        let args = args.clone();
+
+        let original_content = match fs::read_to_string(&file_path) {
+            Ok(content) => Arc::new(content),
+            Err(e) => {
+                eprintln!("Failed to read file '{}': {}", file_path, e);
+                return;
+            }
+        };
+
+        let mode = if let Some(content) = args.content {
+            ContentMode::Static(content)
+        } else if let Some(exec) = args.exec {
+            ContentMode::Exec(exec)
+        } else if !args.replace_regex.is_empty() {
+            ContentMode::ReplaceRegex(parse_pairs(args.replace_regex))
+        } else if !args.replace_exec.is_empty() {
+            ContentMode::ReplaceExec(parse_pairs(args.replace_exec))
+        } else {
+            ContentMode::Original
+        };
+
+        let original_metadata = match fs::metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                eprintln!("Failed to read file metadata: {}", e);
+                return;
+            }
+        };
+
+        let original_attr = FileAttr {
+            ino: 1,
+            size: original_content.len() as u64,
+            blocks: 1,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: original_metadata.permissions().mode() as u16,
+            nlink: original_metadata.nlink() as u32,
+            uid: original_metadata.uid(),
+            gid: original_metadata.gid(),
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
+        };
+
+        let mut options = vec![
+            MountOption::RO,
+            MountOption::FSName("miragefs".to_string()),
+            MountOption::AutoUnmount,
+            MountOption::DefaultPermissions,
+        ];
+
+        if args.allow_other {
+            options.push(MountOption::AllowOther);
         }
-    };
 
-    let mode = if let Some(content) = args.content {
-        ContentMode::Static(content)
-    } else if let Some(exec) = args.exec {
-        ContentMode::Exec(exec)
-    } else if !args.replace_regex.is_empty() {
-        ContentMode::ReplaceRegex(parse_pairs(args.replace_regex))
-    } else if !args.replace_exec.is_empty() {
-        ContentMode::ReplaceExec(parse_pairs(args.replace_exec))
-    } else {
-        ContentMode::Original
-    };
+        let filesystem = MirageFS {
+            original_content,
+            mode,
+            original_attr,
+            shell: args.shell,
+        };
 
-    let original_metadata = match fs::metadata(&args.file_path) {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            eprintln!("Failed to read file metadata: {}", e);
-            return;
-        }
-    };
+        let handle = thread::spawn(move || {
+            fuser::mount2(filesystem, &file_path, &options).expect("Failed to mount filesystem");
+        });
 
-    let original_attr = FileAttr {
-        ino: 1,
-        size: original_content.len() as u64,
-        blocks: 1,
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
-        ctime: UNIX_EPOCH,
-        crtime: UNIX_EPOCH,
-        kind: FileType::RegularFile,
-        perm: original_metadata.permissions().mode() as u16,
-        nlink: original_metadata.nlink() as u32,
-        uid: original_metadata.uid(),
-        gid: original_metadata.gid(),
-        rdev: 0,
-        flags: 0,
-        blksize: 512,
-    };
-
-    let mut options = vec![
-        MountOption::RO,
-        MountOption::FSName("miragefs".to_string()),
-        MountOption::AutoUnmount,
-        MountOption::DefaultPermissions,
-    ];
-
-    if args.allow_other {
-        options.push(MountOption::AllowOther);
+        handles.push(handle);
     }
 
-    let filesystem = MirageFS {
-        original_content,
-        mode,
-        original_attr,
-        shell: args.shell,
-    };
-
-    if let Err(e) = fuser::mount2(filesystem, &args.file_path, &options) {
-        eprintln!("Failed to mount filesystem: {}", e);
+    for handle in handles {
+        handle.join().expect("Thread panicked");
     }
 }
