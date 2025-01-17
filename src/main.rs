@@ -60,6 +60,7 @@ enum ContentMode {
 }
 
 struct MirageFS {
+    file: String,
     original_content: Arc<String>,
     mode: ContentMode,
     original_attr: FileAttr,
@@ -98,6 +99,7 @@ impl MirageFS {
             .arg(command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .uid(req.uid())
             .gid(req.gid())
             .spawn()
@@ -110,7 +112,18 @@ impl MirageFS {
                     }
                 }
                 match child.wait_with_output() {
-                    Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+                    Ok(output) => {
+                        if output.status.success() {
+                            String::from_utf8_lossy(&output.stdout).to_string()
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            eprintln!(
+                                "Failed to run command for file {} with stderr: {}",
+                                self.file, stderr
+                            );
+                            String::new()
+                        }
+                    }
                     Err(e) => {
                         eprintln!("Failed to read command output: {}", e);
                         String::new()
@@ -251,6 +264,7 @@ fn main() {
         }
 
         let filesystem = MirageFS {
+            file: file_path.clone(),
             original_content,
             mode,
             original_attr,
