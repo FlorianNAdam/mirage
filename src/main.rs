@@ -6,6 +6,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -310,8 +311,25 @@ fn terminate_children() {
         let parent = process.parent();
 
         if process.parent() == Some(current_pid) {
+            terminate_process_and_children(&system, pid);
+        }
+    }
+}
+
+fn terminate_process_and_children(sys: &System, pid: sysinfo::Pid) {
+    let mut visited = HashSet::new();
+    let mut stack = vec![pid];
+
+    while let Some(pid) = stack.pop() {
+        if visited.insert(pid) {
             if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), Signal::SIGTERM) {
-                eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e);
+                eprintln!("Failed to kill process {}: {}", pid, e);
+            }
+
+            for (&child_pid, process) in sys.processes() {
+                if process.parent() == Some(pid) {
+                    stack.push(child_pid);
+                }
             }
         }
     }
