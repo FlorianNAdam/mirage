@@ -302,6 +302,8 @@ struct FusersHandle {
 }
 
 fn terminate_children() {
+    println!("Terminating remaining children");
+
     let mut system = System::new_all();
     system.refresh_all();
 
@@ -311,24 +313,11 @@ fn terminate_children() {
         let parent = process.parent();
 
         if process.parent() == Some(current_pid) {
-            terminate_process_and_children(&system, pid);
-        }
-    }
-}
+            if process.name() == "fusermount3" {
+                println!("Found direct child: {:?} ({})", process.name(), pid);
 
-fn terminate_process_and_children(sys: &System, pid: sysinfo::Pid) {
-    let mut visited = HashSet::new();
-    let mut stack = vec![pid];
-
-    while let Some(pid) = stack.pop() {
-        if visited.insert(pid) {
-            if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), Signal::SIGTERM) {
-                eprintln!("Failed to kill process {}: {}", pid, e);
-            }
-
-            for (&child_pid, process) in sys.processes() {
-                if process.parent() == Some(pid) {
-                    stack.push(child_pid);
+                if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), Signal::SIGTERM) {
+                    eprintln!("Failed to kill process {}: {}", pid, e);
                 }
             }
         }
