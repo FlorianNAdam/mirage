@@ -260,28 +260,18 @@ fn fuser_mount_thread(file_path: String, args: Args, shutdown_rx: Receiver<()>) 
 
     shutdown_rx.recv().expect("Failed to receive from channel");
 
-    println!("Received shutdown");
     fusers_handle.join();
-    println!("Unmounted and joined fusers");
 }
 
 fn signal_handler_thread(handles: Vec<FusersHandle>) {
     let mut signals = Signals::new(&[SIGTERM, SIGINT]).unwrap();
     for sig in signals.forever() {
         match sig {
-            SIGINT => {
-                println!("Received SIGINT (Ctrl+C)");
-            }
-            SIGTERM => {
-                println!("Received SIGTERM");
-            }
+            SIGINT | SIGTERM => {}
             _ => continue,
         }
 
-        println!("Sending to shutdown_txs");
         for handle in handles {
-            println!("Sending to shutdown_tx");
-
             handle
                 .shutdown_tx
                 .send(())
@@ -289,8 +279,6 @@ fn signal_handler_thread(handles: Vec<FusersHandle>) {
 
             handle.thread.join().expect("Fuser mount thread panicked");
         }
-
-        println!("All sent!");
 
         break;
     }
@@ -302,8 +290,6 @@ struct FusersHandle {
 }
 
 fn terminate_children() {
-    println!("Terminating remaining children");
-
     send_to_children(Signal::SIGTERM);
 
     sleep(Duration::from_secs(1));
@@ -320,8 +306,6 @@ fn send_to_children(signal: Signal) {
     for (&pid, process) in system.processes() {
         if process.parent() == Some(current_pid) {
             if process.name() == "fusermount3" {
-                println!("Found direct child: {:?} ({})", process.name(), pid);
-
                 if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), signal) {
                     eprintln!("Failed to kill process {}: {}", pid, e);
                 }
@@ -353,15 +337,11 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    println!("Created {} threads", handles.len());
-
     // Create signal handler thread
     let signal_handle = thread::spawn(move || signal_handler_thread(handles));
 
     // wait for signal handler thread to terminate
     signal_handle.join().expect("Signal handler panicked");
-
-    println!("Signal handler thread terminated");
 
     terminate_children();
 }
