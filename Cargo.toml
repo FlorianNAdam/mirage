@@ -6,4 +6,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.26", features = ["derive"] }
 fuser = "0.15.1"
+nix = { version = "0.29.0", features = ["signal", "process"] }
 regex = "1.11.1"
+signal-hook = "0.3.17"
+sysinfo = "0.33.1"

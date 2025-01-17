@@ -2,7 +2,14 @@ use clap::Parser;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyEntry, Request,
 };
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid as NixPid;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+use std::thread::JoinHandle;
 use std::{
     ffi::OsStr,
     fs,
@@ -15,6 +22,7 @@ use std::{
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
+use sysinfo::System;
 
 const ENOENT: i32 = 2;
 const TTL: Duration = Duration::from_secs(1);
@@ -60,7 +68,6 @@ enum ContentMode {
 }
 
 struct MirageFS {
-    file: String,
     original_content: Arc<String>,
     mode: ContentMode,
     original_attr: FileAttr,
@@ -82,10 +89,7 @@ impl MirageFS {
             ContentMode::ReplaceExec(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, command) in pairs {
-                    if content.contains(target) {
-                        let replacement = self.run_command(command, req);
-                        content = content.replace(target, &replacement);
-                    }
+                    content = content.replace(target, &self.run_command(command, req));
                 }
                 content
             }
@@ -99,7 +103,6 @@ impl MirageFS {
             .arg(command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
             .uid(req.uid())
             .gid(req.gid())
             .spawn()
@@ -112,16 +115,7 @@ impl MirageFS {
                     }
                 }
                 match child.wait_with_output() {
-                    Ok(output) => {
-                        if output.status.success() {
-                            String::from_utf8_lossy(&output.stdout).to_string()
-                        } else {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            eprintln!("Failed to run command for file {} with stderr:", self.file);
-                            eprintln!("{}", stderr);
-                            String::new()
-                        }
-                    }
+                    Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
                     Err(e) => {
                         eprintln!("Failed to read command output: {}", e);
                         String::new()
@@ -195,88 +189,166 @@ fn parse_pairs(pairs: Vec<String>) -> Vec<(String, String)> {
         .collect()
 }
 
+fn fuser_mount_thread(file_path: String, args: Args, shutdown_rx: Receiver<()>) {
+    let original_content = match fs::read_to_string(&file_path) {
+        Ok(content) => Arc::new(content),
+        Err(e) => {
+            eprintln!("Failed to read file '{}': {}", file_path, e);
+            return;
+        }
+    };
+
+    let mode = if let Some(content) = args.content {
+        ContentMode::Static(content)
+    } else if let Some(exec) = args.exec {
+        ContentMode::Exec(exec)
+    } else if !args.replace_regex.is_empty() {
+        ContentMode::ReplaceRegex(parse_pairs(args.replace_regex))
+    } else if !args.replace_exec.is_empty() {
+        ContentMode::ReplaceExec(parse_pairs(args.replace_exec))
+    } else {
+        ContentMode::Original
+    };
+
+    let original_metadata = match fs::metadata(&file_path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            eprintln!("Failed to read file metadata: {}", e);
+            return;
+        }
+    };
+
+    let original_attr = FileAttr {
+        ino: 1,
+        size: original_content.len() as u64,
+        blocks: 1,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: original_metadata.permissions().mode() as u16,
+        nlink: original_metadata.nlink() as u32,
+        uid: original_metadata.uid(),
+        gid: original_metadata.gid(),
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
+    };
+
+    let mut options = vec![
+        MountOption::RO,
+        MountOption::FSName("miragefs".to_string()),
+        MountOption::AutoUnmount,
+        MountOption::DefaultPermissions,
+    ];
+
+    if args.allow_other {
+        options.push(MountOption::AllowOther);
+    }
+
+    let filesystem = MirageFS {
+        original_content,
+        mode,
+        original_attr,
+        shell: args.shell,
+    };
+
+    let fusers_handle =
+        fuser::spawn_mount2(filesystem, &file_path, &options).expect("Failed to mount filesystem");
+
+    shutdown_rx.recv().expect("Failed to receive from channel");
+
+    println!("Received shutdown");
+    fusers_handle.join();
+    println!("Unmounted and joined fusers");
+}
+
+fn signal_handler_thread(handles: Vec<FusersHandle>) {
+    let mut signals = Signals::new(&[SIGTERM, SIGINT]).unwrap();
+    for sig in signals.forever() {
+        match sig {
+            SIGINT => {
+                println!("Received SIGINT (Ctrl+C)");
+            }
+            SIGTERM => {
+                println!("Received SIGTERM");
+            }
+            _ => continue,
+        }
+
+        println!("Sending to shutdown_txs");
+        for handle in handles {
+            println!("Sending to shutdown_tx");
+
+            handle
+                .shutdown_tx
+                .send(())
+                .expect("Failed to send shutdown to thread");
+
+            handle.thread.join().expect("Fuser mount thread panicked");
+        }
+
+        println!("All sent!");
+
+        break;
+    }
+}
+
+struct FusersHandle {
+    thread: JoinHandle<()>,
+    shutdown_tx: Sender<()>,
+}
+
+fn terminate_children() {
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    let current_pid = sysinfo::Pid::from_u32(std::process::id() as u32);
+
+    for (&pid, process) in system.processes() {
+        let parent = process.parent();
+
+        if process.parent() == Some(current_pid) {
+            if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), Signal::SIGTERM) {
+                eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e);
+            }
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    let paths = args.clone().file_paths.into_iter().map(|s| s.to_string());
+    let paths = args.clone().file_paths.into_iter();
 
-    let mut handles = vec![];
-    for file_path in paths {
-        let args = args.clone();
+    // create fusers mount thread for each file
+    let handles = paths
+        .into_iter()
+        .map(|file_path| {
+            let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
-        let original_content = match fs::read_to_string(&file_path) {
-            Ok(content) => Arc::new(content),
-            Err(e) => {
-                eprintln!("Failed to read file '{}': {}", file_path, e);
-                return;
+            let handle = thread::spawn({
+                let args = args.clone();
+                move || fuser_mount_thread(file_path, args, shutdown_rx)
+            });
+
+            FusersHandle {
+                thread: handle,
+                shutdown_tx,
             }
-        };
+        })
+        .collect::<Vec<_>>();
 
-        let mode = if let Some(content) = args.content {
-            ContentMode::Static(content)
-        } else if let Some(exec) = args.exec {
-            ContentMode::Exec(exec)
-        } else if !args.replace_regex.is_empty() {
-            ContentMode::ReplaceRegex(parse_pairs(args.replace_regex))
-        } else if !args.replace_exec.is_empty() {
-            ContentMode::ReplaceExec(parse_pairs(args.replace_exec))
-        } else {
-            ContentMode::Original
-        };
+    println!("Created {} threads", handles.len());
 
-        let original_metadata = match fs::metadata(&file_path) {
-            Ok(metadata) => metadata,
-            Err(e) => {
-                eprintln!("Failed to read file metadata: {}", e);
-                return;
-            }
-        };
+    // Create signal handler thread
+    let signal_handle = thread::spawn(move || signal_handler_thread(handles));
 
-        let original_attr = FileAttr {
-            ino: 1,
-            size: original_content.len() as u64,
-            blocks: 1,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::RegularFile,
-            perm: original_metadata.permissions().mode() as u16,
-            nlink: original_metadata.nlink() as u32,
-            uid: original_metadata.uid(),
-            gid: original_metadata.gid(),
-            rdev: 0,
-            flags: 0,
-            blksize: 512,
-        };
+    // wait for signal handler thread to terminate
+    signal_handle.join().expect("Signal handler panicked");
 
-        let mut options = vec![
-            MountOption::RO,
-            MountOption::FSName("miragefs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::DefaultPermissions,
-        ];
+    println!("Signal handler thread terminated");
 
-        if args.allow_other {
-            options.push(MountOption::AllowOther);
-        }
-
-        let filesystem = MirageFS {
-            file: file_path.clone(),
-            original_content,
-            mode,
-            original_attr,
-            shell: args.shell,
-        };
-
-        let handle = thread::spawn(move || {
-            fuser::mount2(filesystem, &file_path, &options).expect("Failed to mount filesystem");
-        });
-
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().expect("Thread panicked");
-    }
+    terminate_children();
 }
