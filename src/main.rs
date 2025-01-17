@@ -81,7 +81,10 @@ impl MirageFS {
             ContentMode::ReplaceExec(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, command) in pairs {
-                    content = content.replace(target, &self.run_command(command, req));
+                    let replacement = self.run_command(command, req);
+                    if content.contains(target) {
+                        content = content.replace(target, &replacement);
+                    }
                 }
                 content
             }
