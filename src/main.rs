@@ -6,10 +6,10 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+use std::thread::sleep;
 use std::thread::JoinHandle;
 use std::{
     ffi::OsStr,
@@ -304,19 +304,25 @@ struct FusersHandle {
 fn terminate_children() {
     println!("Terminating remaining children");
 
+    send_to_children(Signal::SIGTERM);
+
+    sleep(Duration::from_secs(1));
+
+    send_to_children(Signal::SIGKILL);
+}
+
+fn send_to_children(signal: Signal) {
     let mut system = System::new_all();
     system.refresh_all();
 
     let current_pid = sysinfo::Pid::from_u32(std::process::id() as u32);
 
     for (&pid, process) in system.processes() {
-        let parent = process.parent();
-
         if process.parent() == Some(current_pid) {
             if process.name() == "fusermount3" {
                 println!("Found direct child: {:?} ({})", process.name(), pid);
 
-                if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), Signal::SIGTERM) {
+                if let Err(e) = kill(NixPid::from_raw(pid.as_u32() as i32), signal) {
                     eprintln!("Failed to kill process {}: {}", pid, e);
                 }
             }
