@@ -82,8 +82,8 @@ impl MirageFS {
             ContentMode::ReplaceExec(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, command) in pairs {
-                    let replacement = self.run_command(command, req);
                     if content.contains(target) {
+                        let replacement = self.run_command(command, req);
                         content = content.replace(target, &replacement);
                     }
                 }
@@ -117,10 +117,8 @@ impl MirageFS {
                             String::from_utf8_lossy(&output.stdout).to_string()
                         } else {
                             let stderr = String::from_utf8_lossy(&output.stderr);
-                            eprintln!(
-                                "Failed to run command for file {} with stderr: {}",
-                                self.file, stderr
-                            );
+                            eprintln!("Failed to run command for file {} with stderr:", self.file);
+                            eprintln!("{}", stderr);
                             String::new()
                         }
                     }
