@@ -69,6 +69,7 @@ enum ContentMode {
 }
 
 struct MirageFS {
+    file_path: String,
     original_content: Arc<String>,
     mode: ContentMode,
     original_attr: FileAttr,
@@ -124,7 +125,10 @@ impl MirageFS {
                             String::from_utf8_lossy(&output.stdout).to_string()
                         } else {
                             let stderr = String::from_utf8_lossy(&output.stderr);
-                            eprintln!("Failed to run command for file {} with stderr:", self.file);
+                            eprintln!(
+                                "Failed to run command for file {} with stderr:",
+                                self.file_path
+                            );
                             eprintln!("{}", stderr);
                             String::new()
                         }
@@ -261,6 +265,7 @@ fn fuser_mount_thread(file_path: String, args: Args, shutdown_rx: Receiver<()>) 
     }
 
     let filesystem = MirageFS {
+        file_path: file_path.clone(),
         original_content,
         mode,
         original_attr,
