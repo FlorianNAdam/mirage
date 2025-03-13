@@ -1,13 +1,21 @@
+use anyhow::Context;
 use clap::Parser;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyEntry, Request,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 use std::thread;
 use std::thread::sleep;
 use std::thread::JoinHandle;
@@ -36,6 +44,9 @@ const TTL: Duration = Duration::from_secs(1);
 struct Args {
     #[arg(help = "Path to the file to overlay")]
     file_paths: Vec<String>,
+
+    #[arg(long, help = "Path to file containing list of file_paths")]
+    watch_file: Option<PathBuf>,
 
     #[arg(long, conflicts_with_all = &["exec", "replace_regex", "replace_exec"], help = "Use the specified string as the file content.")]
     content: Option<String>,
@@ -70,7 +81,7 @@ enum ContentMode {
 
 struct MirageFS {
     file_path: String,
-    original_content: Arc<String>,
+    original_content: String,
     mode: ContentMode,
     original_attr: FileAttr,
     shell: String,
@@ -206,14 +217,12 @@ fn parse_pairs(pairs: Vec<String>) -> Vec<(String, String)> {
         .collect()
 }
 
-fn fuser_mount_thread(file_path: String, args: Args, shutdown_rx: Receiver<()>) {
-    let original_content = match fs::read_to_string(&file_path) {
-        Ok(content) => Arc::new(content),
-        Err(e) => {
-            eprintln!("Failed to read file '{}': {}", file_path, e);
-            return;
-        }
-    };
+fn add_mirage_fs(file_path: String, args: &Args) -> anyhow::Result<MirageHandle> {
+    let args = args.clone();
+
+    let original_content = fs::read_to_string(&file_path)
+        .context("Failed to read file")
+        .with_context(|| format!("Failed to add mirage fs to file: {:?}", file_path))?;
 
     let mode = if let Some(content) = args.content {
         ContentMode::Static(content)
@@ -227,13 +236,9 @@ fn fuser_mount_thread(file_path: String, args: Args, shutdown_rx: Receiver<()>) 
         ContentMode::Original
     };
 
-    let original_metadata = match fs::metadata(&file_path) {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            eprintln!("Failed to read file metadata: {}", e);
-            return;
-        }
-    };
+    let original_metadata = fs::metadata(&file_path)
+        .context("Failed to read file metadata")
+        .with_context(|| format!("Failed to add mirage fs to file: {:?}", file_path))?;
 
     let original_attr = FileAttr {
         ino: 1,
@@ -272,38 +277,36 @@ fn fuser_mount_thread(file_path: String, args: Args, shutdown_rx: Receiver<()>) 
         shell: args.shell,
     };
 
-    let fusers_handle =
-        fuser::spawn_mount2(filesystem, &file_path, &options).expect("Failed to mount filesystem");
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
-    shutdown_rx.recv().expect("Failed to receive from channel");
+    let handle = thread::spawn(move || {
+        let fusers_handle = fuser::spawn_mount2(filesystem, file_path, &options)
+            .expect("Failed to mount filesystem");
 
-    fusers_handle.join();
+        shutdown_rx.recv().expect("Failed to receive from channel");
+
+        fusers_handle.join();
+    });
+
+    Ok(MirageHandle {
+        thread: handle,
+        shutdown_tx,
+    })
 }
 
-fn signal_handler_thread(handles: Vec<FusersHandle>) {
-    let mut signals = Signals::new(&[SIGTERM, SIGINT]).unwrap();
-    for sig in signals.forever() {
-        match sig {
-            SIGINT | SIGTERM => {}
-            _ => continue,
-        }
-
-        for handle in handles {
-            handle
-                .shutdown_tx
-                .send(())
-                .expect("Failed to send shutdown to thread");
-
-            handle.thread.join().expect("Fuser mount thread panicked");
-        }
-
-        break;
-    }
-}
-
-struct FusersHandle {
+struct MirageHandle {
     thread: JoinHandle<()>,
     shutdown_tx: Sender<()>,
+}
+
+impl MirageHandle {
+    fn shutdown(self) {
+        self.shutdown_tx
+            .send(())
+            .expect("Failed to send shutdown to thread");
+
+        self.thread.join().expect("Fuser mount thread panicked");
+    }
 }
 
 fn terminate_children() {
@@ -331,34 +334,124 @@ fn send_to_children(signal: Signal) {
     }
 }
 
+fn watch_file_thread(
+    file_path: PathBuf,
+    args: Args,
+    handles: Arc<Mutex<Vec<MirageHandle>>>,
+) -> notify::Result<()> {
+    let (tx, rx) = mpsc::channel();
+
+    let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
+    watcher.watch(&file_path, RecursiveMode::NonRecursive)?;
+
+    let mut watched_files = HashSet::new();
+
+    process_watch_file(
+        file_path.clone(),
+        &args,
+        &mut watched_files,
+        handles.clone(),
+    );
+    for event in rx {
+        match event {
+            Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
+                process_watch_file(
+                    file_path.clone(),
+                    &args,
+                    &mut watched_files,
+                    handles.clone(),
+                );
+            }
+            Err(e) => eprintln!("Watch error: {:?}", e),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn process_watch_file(
+    file_path: PathBuf,
+    args: &Args,
+    watched_files: &mut HashSet<String>,
+    handles: Arc<Mutex<Vec<MirageHandle>>>,
+) {
+    if let Ok(file) = OpenOptions::new().read(true).open(&file_path) {
+        let reader = BufReader::new(file);
+        for file in reader.lines().flatten() {
+            if watched_files.insert(file.clone()) {
+                match add_mirage_fs(file.clone(), &args) {
+                    Ok(handle) => {
+                        let mut handles = handles
+                            .lock()
+                            .expect("Failed to obtain lock for mirage handles");
+                        handles.push(handle);
+                    }
+                    Err(e) => {
+                        eprintln!("{:?}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn signal_handler(handles: Arc<Mutex<Vec<MirageHandle>>>) {
+    // wait for signal
+    let mut signals = Signals::new(&[SIGTERM, SIGINT]).unwrap();
+    for sig in signals.forever() {
+        match sig {
+            SIGINT | SIGTERM => {}
+            _ => continue,
+        }
+
+        let mut handles = handles
+            .lock()
+            .expect("Failed to obtain lock for mirage handles");
+
+        let handles = std::mem::take(&mut *handles);
+
+        for handle in handles {
+            handle.shutdown();
+        }
+
+        break;
+    }
+
+    // clean-up just to be safe
+    terminate_children();
+}
+
 fn main() {
     let args = Args::parse();
 
     let paths = args.clone().file_paths.into_iter();
 
     // create fusers mount thread for each file
-    let handles = paths
-        .into_iter()
-        .map(|file_path| {
-            let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
-
-            let handle = thread::spawn({
-                let args = args.clone();
-                move || fuser_mount_thread(file_path, args, shutdown_rx)
-            });
-
-            FusersHandle {
-                thread: handle,
-                shutdown_tx,
+    let mut handles = Vec::new();
+    for file_path in paths {
+        match add_mirage_fs(file_path.clone(), &args) {
+            Ok(handle) => {
+                handles.push(handle);
             }
-        })
-        .collect::<Vec<_>>();
+            Err(e) => {
+                eprintln!("{:?}", e);
+            }
+        }
+    }
 
-    // Create signal handler thread
-    let signal_handle = thread::spawn(move || signal_handler_thread(handles));
+    let handles = Arc::new(Mutex::new(handles));
 
-    // wait for signal handler thread to terminate
-    signal_handle.join().expect("Signal handler panicked");
+    // spawn watcher thread
+    if let Some(watch_file) = args.watch_file.clone() {
+        let watch_file_thread = thread::spawn({
+            let args = args.clone();
+            let handles = handles.clone();
+            move || watch_file_thread(watch_file, args, handles)
+        });
 
-    terminate_children();
+        watch_file_thread.join().unwrap().unwrap();
+    }
+
+    signal_handler(handles);
 }
