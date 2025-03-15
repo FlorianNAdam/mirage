@@ -220,6 +220,8 @@ fn parse_pairs(pairs: Vec<String>) -> Vec<(String, String)> {
 fn add_mirage_fs(file_path: String, args: &Args) -> anyhow::Result<MirageHandle> {
     let args = args.clone();
 
+    println!("adding mirage to file: {:?}", file_path);
+
     let original_content = fs::read_to_string(&file_path)
         .context("Failed to read file")
         .with_context(|| format!("Failed to add mirage fs to file: {:?}", file_path))?;
@@ -404,6 +406,8 @@ fn signal_handler(handles: Arc<Mutex<Vec<MirageHandle>>>) {
             SIGINT | SIGTERM => {}
             _ => continue,
         }
+
+        println!("Received shutdown signal");
 
         let mut handles = handles
             .lock()
