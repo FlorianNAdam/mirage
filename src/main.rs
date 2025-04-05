@@ -5,7 +5,7 @@ use fuser::{
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, EventKind, INotifyWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::collections::HashSet;
@@ -336,16 +336,11 @@ fn send_to_children(signal: Signal) {
     }
 }
 
-fn watch_file_thread(
+fn watch_file(
     file_path: PathBuf,
     args: Args,
     handles: Arc<Mutex<Vec<MirageHandle>>>,
-) -> notify::Result<()> {
-    let (tx, rx) = mpsc::channel();
-
-    let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-    watcher.watch(&file_path, RecursiveMode::NonRecursive)?;
-
+) -> notify::Result<INotifyWatcher> {
     let mut watched_files = HashSet::new();
 
     process_watch_file(
@@ -354,22 +349,28 @@ fn watch_file_thread(
         &mut watched_files,
         handles.clone(),
     );
-    for event in rx {
-        match event {
-            Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
-                process_watch_file(
-                    file_path.clone(),
-                    &args,
-                    &mut watched_files,
-                    handles.clone(),
-                );
-            }
-            Err(e) => eprintln!("Watch error: {:?}", e),
-            _ => {}
-        }
-    }
 
-    Ok(())
+    let mut watcher = RecommendedWatcher::new(
+        {
+            let file_path = file_path.clone();
+            move |event: Result<notify::Event, notify::Error>| match event {
+                Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
+                    process_watch_file(
+                        file_path.clone(),
+                        &args,
+                        &mut watched_files,
+                        handles.clone(),
+                    );
+                }
+                Err(e) => eprintln!("Watch error: {:?}", e),
+                _ => {}
+            }
+        },
+        Config::default(),
+    )?;
+    watcher.watch(&file_path, RecursiveMode::NonRecursive)?;
+
+    Ok(watcher)
 }
 
 fn process_watch_file(
@@ -446,16 +447,12 @@ fn main() {
 
     let handles = Arc::new(Mutex::new(handles));
 
-    // spawn watcher thread
-    if let Some(watch_file) = args.watch_file.clone() {
-        let watch_file_thread = thread::spawn({
-            let args = args.clone();
-            let handles = handles.clone();
-            move || watch_file_thread(watch_file, args, handles)
-        });
-
-        watch_file_thread.join().unwrap().unwrap();
-    }
+    // create file watcher
+    let watcher = args
+        .watch_file
+        .as_ref()
+        .map(|file| watch_file(file.clone(), args.clone(), handles.clone()));
 
     signal_handler(handles);
+    drop(watcher);
 }
