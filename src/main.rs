@@ -48,17 +48,41 @@ struct Args {
     #[arg(long, help = "Path to file containing list of file_paths")]
     watch_file: Option<PathBuf>,
 
-    #[arg(long, conflicts_with_all = &["exec", "replace_regex", "replace_exec"], help = "Use the specified string as the file content.")]
+    #[arg(
+        long,
+        group = "mode",
+        help = "Use the specified string as the file content."
+    )]
     content: Option<String>,
 
-    #[arg(long, conflicts_with_all = &["content", "replace_regex", "replace_exec"], help = "Execute a command with the original content; use its output as the file content.")]
+    #[arg(
+        long,
+        group = "mode",
+        help = "Execute a command with the original content; use its output as the file content."
+    )]
     exec: Option<String>,
 
-    #[arg(long, action = clap::ArgAction::Append, conflicts_with_all = &["content", "exec", "replace_exec"], help = "Replace PATTERN with REPLACEMENT in the original content. Format: PATTERN=REPLACEMENT. Can be specified multiple times.")]
+    #[arg(
+        long,
+        group = "mode",
+        help = "Replace PATTERN with REPLACEMENT in the original content. Format: PATTERN=REPLACEMENT. Can be specified multiple times.",
+        action = clap::ArgAction::Append
+    )]
     replace_regex: Vec<String>,
 
-    #[arg(long, action = clap::ArgAction::Append, conflicts_with_all = &["content", "exec", "replace_regex"], help = "Replace PATTERN by executing COMMAND. Format: PATTERN=COMMAND. Can be specified multiple times.")]
+    #[arg(long, group = "mode", help = "Path to a file of --replace-regex pairs")]
+    replace_regex_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        group = "mode",
+        help = "Replace PATTERN by executing COMMAND. Format: PATTERN=COMMAND. Can be specified multiple times.",
+        action = clap::ArgAction::Append
+    )]
     replace_exec: Vec<String>,
+
+    #[arg(long, group = "mode", help = "Path to a file of --replace-exec pairs")]
+    replace_exec_file: Option<PathBuf>,
 
     #[arg(long, help = "Allow other users to access the mounted filesystem.")]
     allow_other: bool,
@@ -66,7 +90,7 @@ struct Args {
     #[arg(
         long,
         default_value = "sh",
-        help = "Specify the shell to use for executing commands (default: sh)."
+        help = "Specify the shell to use for executing commands."
     )]
     shell: String,
 }
@@ -75,7 +99,9 @@ enum ContentMode {
     Static(String),
     Exec(String),
     ReplaceRegex(Vec<(String, String)>),
+    ReplaceRegexFile(PathBuf),
     ReplaceExec(Vec<(String, String)>),
+    ReplaceExecFile(PathBuf),
     Original,
 }
 
@@ -99,6 +125,20 @@ impl MirageFS {
                 }
                 content
             }
+            ContentMode::ReplaceRegexFile(path) => {
+                if let Ok(pairs) = fs::read_to_string(path) {
+                    let pairs = pairs.trim().lines().collect::<Vec<_>>();
+                    let pairs = parse_pairs(&pairs);
+
+                    let mut content = self.original_content.to_string();
+                    for (target, replacement) in pairs {
+                        content = content.replace(&target, &replacement);
+                    }
+                    content
+                } else {
+                    todo!()
+                }
+            }
             ContentMode::ReplaceExec(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, command) in pairs {
@@ -108,6 +148,23 @@ impl MirageFS {
                     }
                 }
                 content
+            }
+            ContentMode::ReplaceExecFile(path) => {
+                if let Ok(pairs) = fs::read_to_string(path) {
+                    let pairs = pairs.trim().lines().collect::<Vec<_>>();
+                    let pairs = parse_pairs(&pairs);
+
+                    let mut content = self.original_content.to_string();
+                    for (target, command) in pairs {
+                        if content.contains(&target) {
+                            let replacement = self.run_command(&command, req);
+                            content = content.replace(&target, &replacement);
+                        }
+                    }
+                    content
+                } else {
+                    todo!()
+                }
             }
             ContentMode::Original => self.original_content.to_string(),
         }
@@ -204,13 +261,13 @@ impl Filesystem for MirageFS {
     }
 }
 
-fn parse_pairs(pairs: Vec<String>) -> Vec<(String, String)> {
+fn parse_pairs(pairs: &[&str]) -> Vec<(String, String)> {
     pairs
-        .into_iter()
+        .iter()
         .filter_map(|pair| match pair.split_once('=') {
             Some((k, v)) => Some((k.to_string(), v.to_string())),
             None => {
-                eprintln!("Invalid format, expected PATTERN=REPLACEMENT or PATTERN=COMMAND");
+                eprintln!("Failed to parse: {:?}", pair);
                 None
             }
         })
@@ -231,9 +288,25 @@ fn add_mirage_fs(file_path: String, args: &Args) -> anyhow::Result<MirageHandle>
     } else if let Some(exec) = args.exec {
         ContentMode::Exec(exec)
     } else if !args.replace_regex.is_empty() {
-        ContentMode::ReplaceRegex(parse_pairs(args.replace_regex))
+        ContentMode::ReplaceRegex(parse_pairs(
+            &args
+                .replace_regex
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>(),
+        ))
+    } else if let Some(path) = args.replace_regex_file {
+        ContentMode::ReplaceRegexFile(path)
     } else if !args.replace_exec.is_empty() {
-        ContentMode::ReplaceExec(parse_pairs(args.replace_exec))
+        ContentMode::ReplaceExec(parse_pairs(
+            &args
+                .replace_exec
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>(),
+        ))
+    } else if let Some(path) = args.replace_exec_file {
+        ContentMode::ReplaceExecFile(path)
     } else {
         ContentMode::Original
     };
