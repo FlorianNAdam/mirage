@@ -8,8 +8,9 @@ use nix::unistd::Pid as NixPid;
 use notify::{Config, EventKind, INotifyWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs::OpenOptions;
+use std::fs::{read_link, OpenOptions};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -93,6 +94,34 @@ struct Args {
         help = "Specify the shell to use for executing commands."
     )]
     shell: String,
+
+    #[arg(
+        long,
+        help = "Exclude users with GID from seing overlay",
+        action = clap::ArgAction::Append
+    )]
+    exclude_gid: Vec<u32>,
+
+    #[arg(
+        long,
+        help = "Exclude user with UID from seing overlay",
+        action = clap::ArgAction::Append
+    )]
+    exclude_uid: Vec<u32>,
+
+    #[arg(
+        long,
+        help = "Exclude process with UID from seing overlay",
+        action = clap::ArgAction::Append
+    )]
+    exclude_pid: Vec<u32>,
+
+    #[arg(
+        long,
+        help = "Exclude specified executable from seing overlay",
+        action = clap::ArgAction::Append
+    )]
+    exclude_exe: Vec<PathBuf>,
 }
 
 enum ContentMode {
@@ -111,19 +140,38 @@ struct MirageFS {
     mode: ContentMode,
     original_attr: FileAttr,
     shell: String,
+    excluded_uids: HashSet<u32>,
+    excluded_gids: HashSet<u32>,
+    excluded_pids: HashSet<u32>,
+    excluded_exes: HashSet<PathBuf>,
 }
 
 impl MirageFS {
-    fn get_content(&self, req: &Request) -> String {
+    fn get_content(&self, req: &Request) -> Cow<str> {
+        let exe = read_link(format!("/proc/{}/exe", req.pid())).unwrap_or("<failed>".into());
+
+        if self.excluded_uids.contains(&req.uid())
+            || self.excluded_gids.contains(&req.gid())
+            || self.excluded_pids.contains(&req.pid())
+            || self.excluded_exes.contains(&exe)
+        {
+            return Cow::Borrowed(&self.original_content);
+        }
+
+        println!(
+            "comm: {:?}",
+            read_link(format!("/proc/{}/exe", req.pid())).unwrap()
+        );
+
         match &self.mode {
-            ContentMode::Static(data) => data.clone(),
-            ContentMode::Exec(command) => self.run_command(command, req),
+            ContentMode::Static(data) => Cow::Borrowed(data),
+            ContentMode::Exec(command) => Cow::Owned(self.run_command(command, req)),
             ContentMode::ReplaceRegex(pairs) => {
                 let mut content = self.original_content.to_string();
                 for (target, replacement) in pairs {
                     content = content.replace(target, replacement);
                 }
-                content
+                Cow::Owned(content)
             }
             ContentMode::ReplaceRegexFile(path) => {
                 if let Ok(pairs) = fs::read_to_string(path) {
@@ -134,7 +182,7 @@ impl MirageFS {
                     for (target, replacement) in pairs {
                         content = content.replace(&target, &replacement);
                     }
-                    content
+                    Cow::Owned(content)
                 } else {
                     todo!()
                 }
@@ -147,7 +195,7 @@ impl MirageFS {
                         content = content.replace(target, &replacement);
                     }
                 }
-                content
+                Cow::Owned(content)
             }
             ContentMode::ReplaceExecFile(path) => {
                 if let Ok(pairs) = fs::read_to_string(path) {
@@ -161,12 +209,12 @@ impl MirageFS {
                             content = content.replace(&target, &replacement);
                         }
                     }
-                    content
+                    Cow::Owned(content)
                 } else {
                     todo!()
                 }
             }
-            ContentMode::Original => self.original_content.to_string(),
+            ContentMode::Original => Cow::Borrowed(&self.original_content),
         }
     }
 
@@ -176,6 +224,7 @@ impl MirageFS {
             .arg(command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .uid(req.uid())
             .gid(req.gid())
             .spawn()
@@ -194,8 +243,8 @@ impl MirageFS {
                         } else {
                             let stderr = String::from_utf8_lossy(&output.stderr);
                             eprintln!(
-                                "Failed to run command for file {} with stderr:",
-                                self.file_path
+                                "Failed to run command {} for file {} with stderr:",
+                                command, self.file_path
                             );
                             eprintln!("{}", stderr);
                             String::new()
@@ -338,6 +387,7 @@ fn add_mirage_fs(file_path: String, args: &Args) -> anyhow::Result<MirageHandle>
         MountOption::FSName("miragefs".to_string()),
         MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
+        MountOption::AllowOther,
     ];
 
     if args.allow_other {
@@ -350,6 +400,10 @@ fn add_mirage_fs(file_path: String, args: &Args) -> anyhow::Result<MirageHandle>
         mode,
         original_attr,
         shell: args.shell,
+        excluded_uids: HashSet::from_iter(args.exclude_uid),
+        excluded_gids: HashSet::from_iter(args.exclude_gid),
+        excluded_pids: HashSet::from_iter(args.exclude_pid),
+        excluded_exes: HashSet::from_iter(args.exclude_exe),
     };
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
