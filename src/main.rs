@@ -387,7 +387,6 @@ fn add_mirage_fs(file_path: String, args: &Args) -> anyhow::Result<MirageHandle>
         MountOption::FSName("miragefs".to_string()),
         MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
-        MountOption::AllowOther,
     ];
 
     if args.allow_other {
